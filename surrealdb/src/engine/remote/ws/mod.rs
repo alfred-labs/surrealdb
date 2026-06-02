@@ -404,7 +404,7 @@ where
 	match result {
 		Ok(DbResult::Query(results)) => {
 			if let Some(command) = pending.command {
-				session_state.replay.push(command);
+				super::record_replayable(&session_state.replay, command);
 			}
 			if let Err(err) = pending.response_channel.send(Ok(results)).await {
 				tracing::error!("Failed to send query results to channel: {err:?}");
@@ -415,14 +415,14 @@ where
 		}
 		Ok(DbResult::Other(mut value)) => {
 			if let Some(command) = pending.command {
-				session_state.replay.push(command.clone());
 				if let Command::Authenticate {
 					token,
 					..
-				} = command
+				} = &command
 				{
-					value = token.into_value();
+					value = token.clone().into_value();
 				}
+				super::record_replayable(&session_state.replay, command);
 			}
 			let result = QueryResultBuilder::started_now().finish_with_result(Ok(value));
 			if let Err(err) = pending.response_channel.send(Ok(vec![result])).await {
@@ -657,6 +657,28 @@ async fn handle_session_drop<M, S, E>(
 		replay_session::<M, S, E>(session_id, &session_state, sink).await.ok();
 	}
 	sessions.remove(&session_id);
+}
+
+/// Dispatch a session-lifecycle event to the appropriate handler.
+async fn handle_session<M, S, E>(
+	session_id: crate::SessionId,
+	sessions: &HashMap<Uuid, Result<Arc<SessionState>, SessionError>>,
+	sink: &RwLock<S>,
+) where
+	M: WsMessage,
+	S: Sink<M, Error = E> + Unpin,
+	E: std::fmt::Debug,
+{
+	match session_id {
+		crate::SessionId::Initial(id) => {
+			handle_session_initial::<M, S, E>(id, sessions, sink).await
+		}
+		crate::SessionId::Clone {
+			old,
+			new,
+		} => handle_session_clone::<M, S, E>(old, new, sessions, sink).await,
+		crate::SessionId::Drop(id) => handle_session_drop::<M, S, E>(id, sessions, sink).await,
+	}
 }
 
 /// Clear all pending requests on connection reset.
